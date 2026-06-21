@@ -56,6 +56,7 @@ class _BaseAsyncClient:
         username: str | None = None,
         password: str | None = None,
         timeout: float = 10.0,
+        source_addr: tuple[str, int] | None = None,
     ):
         if (username is None) != (password is None):
             raise ValueError("username and password must be given together")
@@ -63,6 +64,7 @@ class _BaseAsyncClient:
         self._user = username
         self._pass = password
         self.timeout = timeout
+        self._source_addr = source_addr  # bind the local end (e.g. spread src IPs)
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
         self.bound: tuple[str, int] | None = None
@@ -84,7 +86,9 @@ class _BaseAsyncClient:
         # reachable for cleanup, so a timeout mid-open can't leak the transport.
         try:
             async with asyncio.timeout(self.timeout):
-                reader, writer = await asyncio.open_connection(*self.proxy)
+                reader, writer = await asyncio.open_connection(
+                    *self.proxy, local_addr=self._source_addr
+                )
                 reply = await self._negotiate(reader, writer, host, port, cmd)
         except BaseException:
             if writer is not None:

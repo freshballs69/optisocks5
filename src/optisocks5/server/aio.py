@@ -28,20 +28,25 @@ async def _maybe_await(result):
 
 
 async def _pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    # RuntimeError covers writing to an already-closed transport (uvloop raises
+    # "handler is closed" when the peer dropped while this side is still sending).
     try:
         while True:
             data = await reader.read(65536)
             if not data:
                 break
+            if writer.is_closing():
+                break
             writer.write(data)
             await writer.drain()
-    except OSError:
+    except (OSError, RuntimeError):
         pass
     finally:
-        try:
-            writer.write_eof()
-        except (OSError, RuntimeError):
-            pass
+        if not writer.is_closing():
+            try:
+                writer.write_eof()
+            except (OSError, RuntimeError):
+                pass
 
 
 async def async_splice(down, up) -> None:

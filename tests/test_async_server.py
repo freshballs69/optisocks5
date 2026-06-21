@@ -6,6 +6,34 @@ import asyncio
 import optisocks5 as s5
 from optisocks5.aio import AsyncClient
 from optisocks5.server import AsyncServer, ServerSession
+from optisocks5.server import aio as _aio
+
+
+def test_pump_survives_write_to_closed_transport():
+    # uvloop raises RuntimeError ("handler is closed") when the peer dropped
+    # while this side is still pumping; _pump must swallow it, not crash the task.
+    class Reader:
+        def __init__(self):
+            self.n = 0
+
+        async def read(self, _):
+            self.n += 1
+            return b"x" if self.n == 1 else b""
+
+    class ClosedWriter:
+        def is_closing(self):
+            return False
+
+        def write(self, data):
+            raise RuntimeError("unable to perform operation; the handler is closed")
+
+        async def drain(self):
+            pass
+
+        def write_eof(self):
+            pass
+
+    asyncio.run(_aio._pump(Reader(), ClosedWriter()))  # must not raise
 
 
 def _build_server() -> AsyncServer:

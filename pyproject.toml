@@ -1,0 +1,27 @@
+[project]
+name = "optisocks5"
+version = "0.1.0"
+description = "Sans-IO SOCKS5 codec (C++ core) + an optimistic, pipelining client"
+readme = "README.md"
+authors = [{ name = "Vitaliy", email = "vizhakivskiy@gmail.com" }]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+# The CLI itself is stdlib-only; this extra is the documented install path for
+# the `optisocks5` command and the home for any future CLI-only niceties.
+cli = []
+
+[project.scripts]
+optisocks5 = "optisocks5.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

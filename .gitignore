@@ -1,0 +1,11 @@
+# Python build / cache
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+
+# uv / virtualenv
+.venv/

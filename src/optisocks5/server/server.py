@@ -71,11 +71,16 @@ class Server(Generic[Ctx]):
 
     # ---- threaded blocking reference driver --------------------------------
 
-    def bind(self, host: str, port: int, *, backlog: int = 128) -> tuple[str, int]:
+    def bind(
+        self, host: str, port: int, *, backlog: int = 128, reuse_port: bool = False
+    ) -> tuple[str, int]:
         """Bind + listen; return the actual ``(host, port)`` (port 0 = ephemeral).
-        Pair with :meth:`serve_forever` to run the accept loop in your own thread."""
+        Pair with :meth:`serve_forever` to run the accept loop in your own thread.
+        ``reuse_port`` sets SO_REUSEPORT so several replicas can share the port."""
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if reuse_port and hasattr(socket, "SO_REUSEPORT"):
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         srv.bind((host, port))
         srv.listen(backlog)
         self._sock = srv
@@ -98,9 +103,11 @@ class Server(Generic[Ctx]):
             srv.close()
             self._sock = None
 
-    def serve(self, host: str, port: int, *, backlog: int = 128) -> None:
+    def serve(
+        self, host: str, port: int, *, backlog: int = 128, reuse_port: bool = False
+    ) -> None:
         """Bind and run the accept loop (blocks). Convenience over bind/serve_forever."""
-        self.bind(host, port, backlog=backlog)
+        self.bind(host, port, backlog=backlog, reuse_port=reuse_port)
         self.serve_forever()
 
     def close(self) -> None:

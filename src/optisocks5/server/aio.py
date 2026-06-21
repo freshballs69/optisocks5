@@ -78,12 +78,20 @@ class AsyncServer(Generic[Ctx]):
 
     # ---- driver -------------------------------------------------------------
 
-    async def serve(self, host: str, port: int) -> asyncio.Server:
-        self._server = await asyncio.start_server(self._handle, host, port)
+    async def serve(
+        self, host: str, port: int, *, reuse_port: bool = False
+    ) -> asyncio.Server:
+        # reuse_port=True (SO_REUSEPORT) lets several proxy replicas bind the same
+        # (host, port); the kernel load-balances accepts across them.
+        self._server = await asyncio.start_server(
+            self._handle, host, port, reuse_port=reuse_port
+        )
         return self._server
 
-    async def serve_forever(self, host: str, port: int) -> None:
-        server = await self.serve(host, port)
+    async def serve_forever(
+        self, host: str, port: int, *, reuse_port: bool = False
+    ) -> None:
+        server = await self.serve(host, port, reuse_port=reuse_port)
         async with server:
             await server.serve_forever()
 

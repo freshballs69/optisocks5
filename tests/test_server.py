@@ -289,6 +289,20 @@ def test_connect_refused_maps_to_conn_refused():
         server.close()
 
 
+def test_reuse_port_allows_replicas_on_same_port():
+    if not hasattr(socket, "SO_REUSEPORT"):
+        pytest.skip("platform has no SO_REUSEPORT")
+    a = Server()
+    _, port = a.bind("127.0.0.1", 0, reuse_port=True)
+    b = Server()
+    try:
+        _, port_b = b.bind("127.0.0.1", port, reuse_port=True)  # same port, no error
+        assert port_b == port
+    finally:
+        a.close()
+        b.close()
+
+
 def test_hook_exception_yields_general_failure_reply():
     server = Server()
 

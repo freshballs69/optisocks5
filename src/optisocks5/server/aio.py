@@ -10,6 +10,7 @@ session's streams are exposed as ``(reader, writer)`` tuples:
 from __future__ import annotations
 
 import asyncio
+import errno
 import inspect
 from typing import Callable, Generic, TypeVar
 
@@ -103,13 +104,19 @@ class AsyncServer(Generic[Ctx]):
                     sess.receive(data)
                 elif isinstance(ev, Authorize):
                     if self._authorize is not None:
-                        await _maybe_await(self._authorize(sess, ev.username, ev.password))
+                        try:
+                            await _maybe_await(self._authorize(sess, ev.username, ev.password))
+                        except Exception:  # noqa: BLE001 — bad hook = auth failure
+                            sess.reject()
                     else:
                         sess.ok(None)
                 elif isinstance(ev, Connect):
                     if self._on_connect is not None:
-                        await _maybe_await(self._on_connect(sess, ev.host, ev.port))
-                    if sess._rejected:
+                        try:
+                            await _maybe_await(self._on_connect(sess, ev.host, ev.port))
+                        except Exception:  # noqa: BLE001 — bad hook = general failure
+                            sess.reject(Rep.GENERAL_FAILURE)
+                    if sess.rejected:
                         pass  # next_event emits the error reply + Close
                     elif sess.intercepted:
                         sess.connected(ev.host, ev.port)  # no real dial
@@ -146,6 +153,12 @@ class AsyncServer(Generic[Ctx]):
             )
             sess.connected(*uw.get_extra_info("sockname")[:2])
             return (ur, uw)
-        except (OSError, asyncio.TimeoutError):
-            sess.connect_failed(Rep.HOST_UNREACHABLE)
-            return None
+        except ConnectionRefusedError:
+            sess.connect_failed(Rep.CONN_REFUSED)
+        except (asyncio.TimeoutError, TimeoutError):
+            sess.connect_failed(Rep.TTL_EXPIRED)
+        except OSError as e:
+            sess.connect_failed(
+                Rep.NET_UNREACHABLE if e.errno == errno.ENETUNREACH else Rep.HOST_UNREACHABLE
+            )
+        return None

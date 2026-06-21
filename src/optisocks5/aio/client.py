@@ -8,6 +8,7 @@ live tunnel is exposed as :attr:`reader` / :attr:`writer`.
 from __future__ import annotations
 
 import asyncio
+from typing import Self
 
 from ..core import (
     Cmd,
@@ -76,36 +77,43 @@ class _BaseAsyncClient:
         raise NotImplementedError
 
     async def connect(self, host: str, port: int, cmd: int = Cmd.CONNECT) -> Reply:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(*self.proxy), self.timeout
-        )
+        if self.writer is not None:
+            raise RuntimeError("client already connected; aclose() first")
+        writer: asyncio.StreamWriter | None = None
+        # One total budget over open + negotiate; a bound writer is always
+        # reachable for cleanup, so a timeout mid-open can't leak the transport.
         try:
-            reply = await asyncio.wait_for(
-                self._negotiate(reader, writer, host, port, cmd), self.timeout
-            )
+            async with asyncio.timeout(self.timeout):
+                reader, writer = await asyncio.open_connection(*self.proxy)
+                reply = await self._negotiate(reader, writer, host, port, cmd)
         except BaseException:
-            writer.close()
+            if writer is not None:
+                await self._abort(writer)
             raise
         if not reply.ok:
-            writer.close()
+            await self._abort(writer)
             raise Socks5Error(f"request failed: {rep_name(reply.rep)} ({reply.rep})")
         self.reader, self.writer = reader, writer
         self.bound = (reply.host, reply.port)
         return reply
 
+    @staticmethod
+    async def _abort(writer: asyncio.StreamWriter) -> None:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except OSError:
+            pass
+
     async def aclose(self) -> None:
         if self.writer is not None:
-            self.writer.close()
-            try:
-                await self.writer.wait_closed()
-            except OSError:
-                pass
+            await self._abort(self.writer)
             self.writer = self.reader = None
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> Self:
         return self
 
-    async def __aexit__(self, *exc) -> None:
+    async def __aexit__(self, *exc: object) -> None:
         await self.aclose()
 
 

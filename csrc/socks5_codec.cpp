@@ -5,6 +5,7 @@
 #include <netinet/in.h>
 
 #include <cstring>
+#include <stdexcept>
 
 namespace s5 {
 namespace {
@@ -37,6 +38,8 @@ std::uint8_t classify_host(const std::string& host, std::vector<std::uint8_t>& r
 std::uint8_t encode_address(std::vector<std::uint8_t>& out, const Address& a) {
   std::vector<std::uint8_t> raw;
   std::uint8_t atyp = classify_host(a.host, raw);
+  if (atyp == kDomain && raw.size() > 255)
+    throw std::length_error("domain name exceeds 255 bytes");
   out.push_back(atyp);
   if (atyp == kDomain) out.push_back(static_cast<std::uint8_t>(raw.size()));
   out.insert(out.end(), raw.begin(), raw.end());
@@ -82,6 +85,7 @@ std::optional<Address> decode_address(std::span<const std::uint8_t> data,
 
 std::vector<std::uint8_t> client_greeting(
     std::span<const std::uint8_t> methods) {
+  if (methods.size() > 255) throw std::length_error("too many methods (>255)");
   std::vector<std::uint8_t> out;
   out.reserve(2 + methods.size());
   out.push_back(kVer);
@@ -98,6 +102,8 @@ std::optional<std::uint8_t> parse_method_selection(
 
 std::vector<std::uint8_t> userpass_auth(std::string_view user,
                                         std::string_view pass) {
+  if (user.size() > 255 || pass.size() > 255)
+    throw std::length_error("username/password exceeds 255 bytes");
   std::vector<std::uint8_t> out;
   out.reserve(3 + user.size() + pass.size());
   out.push_back(kAuthVer);

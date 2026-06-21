@@ -13,6 +13,8 @@ handshake phases:
 from __future__ import annotations
 
 import socket
+import time
+from typing import Self
 
 from ..core import (
     Cmd,
@@ -32,9 +34,19 @@ from ..core import (
 __all__ = ["Client", "OptimisticClient"]
 
 
-def _recv_exact(sock: socket.socket, n: int) -> bytes:
+def _arm(sock: socket.socket, deadline: float) -> None:
+    """Set the per-recv timeout from the remaining total-handshake budget so a
+    proxy that dribbles one byte per recv can't outlast `timeout` indefinitely."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise Socks5Error("handshake timed out")
+    sock.settimeout(remaining)
+
+
+def _recv_exact(sock: socket.socket, n: int, deadline: float) -> bytes:
     buf = bytearray()
     while len(buf) < n:
+        _arm(sock, deadline)
         chunk = sock.recv(n - len(buf))
         if not chunk:
             raise Socks5Error("proxy closed connection during handshake")
@@ -42,18 +54,18 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 
-def _recv_reply(sock: socket.socket) -> Reply:
+def _recv_reply(sock: socket.socket, deadline: float) -> Reply:
     """Read EXACTLY one reply — never a byte more, so post-handshake tunnel data
     (e.g. a server-first banner glued behind the reply) is left on the socket."""
-    head = _recv_exact(sock, 4)  # VER REP RSV ATYP
+    head = _recv_exact(sock, 4, deadline)  # VER REP RSV ATYP
     atyp = head[3]
     if atyp == 0x01:  # IPv4
-        body = _recv_exact(sock, 4 + 2)
+        body = _recv_exact(sock, 4 + 2, deadline)
     elif atyp == 0x04:  # IPv6
-        body = _recv_exact(sock, 16 + 2)
+        body = _recv_exact(sock, 16 + 2, deadline)
     elif atyp == 0x03:  # domain: 1 length byte, then that many + port
-        length = _recv_exact(sock, 1)
-        body = length + _recv_exact(sock, length[0] + 2)
+        length = _recv_exact(sock, 1, deadline)
+        body = length + _recv_exact(sock, length[0] + 2, deadline)
     else:
         raise Socks5Error(f"reply has unknown ATYP {atyp}")
     parsed = parse_reply(head + body)
@@ -96,10 +108,10 @@ class _BaseClient:
             self.sock.close()
             self.sock = None
 
-    def __enter__(self):
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.close()
 
 
@@ -107,13 +119,16 @@ class OptimisticClient(_BaseClient):
     """Pipelines the whole handshake in one ``sendall``, then reads."""
 
     def connect(self, host: str, port: int, cmd: int = Cmd.CONNECT) -> Reply:
+        if self.sock is not None:
+            raise RuntimeError("client already connected; close() first")
         sess = Session(self._user, self._pass)
         s = socket.create_connection(self.proxy, timeout=self.timeout)
+        deadline = time.monotonic() + self.timeout  # total handshake budget
         try:
-            s.settimeout(self.timeout)
             s.sendall(sess.optimistic_pipeline(host, port, cmd))  # one shot
             reply: Reply | None = None
             while reply is None:
+                _arm(s, deadline)
                 chunk = s.recv(4096)
                 if not chunk:
                     raise Socks5Error("proxy closed connection during handshake")
@@ -129,26 +144,28 @@ class Client(_BaseClient):
     """Normal staged client — one RTT per phase, multi-method greeting."""
 
     def connect(self, host: str, port: int, cmd: int = Cmd.CONNECT) -> Reply:
+        if self.sock is not None:
+            raise RuntimeError("client already connected; close() first")
         have_auth = self._user is not None
         offered = [Method.USERPASS, Method.NO_AUTH] if have_auth else [Method.NO_AUTH]
         s = socket.create_connection(self.proxy, timeout=self.timeout)
+        deadline = time.monotonic() + self.timeout  # total handshake budget
         try:
-            s.settimeout(self.timeout)
             s.sendall(client_greeting(bytes(offered)))
-            chosen = parse_method_selection(_recv_exact(s, 2))
+            chosen = parse_method_selection(_recv_exact(s, 2, deadline))
             if chosen is None:
                 raise Socks5Error("malformed method selection")
             if chosen == Method.USERPASS:
                 if not have_auth:
                     raise Socks5Error("proxy demands userpass but no creds given")
                 s.sendall(userpass_auth(self._user, self._pass))
-                status = parse_auth_reply(_recv_exact(s, 2))
+                status = parse_auth_reply(_recv_exact(s, 2, deadline))
                 if status != 0:
                     raise Socks5Error(f"auth rejected (status {status})")
             elif chosen != Method.NO_AUTH:
                 raise Socks5Error(f"no acceptable method (proxy chose {chosen})")
             s.sendall(request(cmd, host, port))
-            reply = _recv_reply(s)
+            reply = _recv_reply(s, deadline)
         except BaseException:
             s.close()
             raise

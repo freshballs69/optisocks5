@@ -58,11 +58,25 @@ __all__ = [
 ]
 
 
-# Async drivers are exposed lazily so `import optisocks5` doesn't pull in asyncio
-# unless asked: `from optisocks5.aio import AsyncOptimisticClient`.
-def __getattr__(name: str):
-    if name in ("AsyncClient", "AsyncOptimisticClient"):
-        from . import aio
+# The async clients and the whole server layer are exposed lazily so a bare
+# `import optisocks5` doesn't pull in asyncio or the server unless asked.
+_LAZY = {
+    "AsyncClient": "optisocks5.aio",
+    "AsyncOptimisticClient": "optisocks5.aio",
+    "Server": "optisocks5.server",
+    "AsyncServer": "optisocks5.server",
+    "ServerSession": "optisocks5.server",
+}
 
-        return getattr(aio, name)
+
+def __getattr__(name: str):
+    mod = _LAZY.get(name)
+    if mod is not None:
+        import importlib
+
+        return getattr(importlib.import_module(mod), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted([*__all__, *_LAZY])

@@ -6,6 +6,8 @@ import asyncio
 import socket
 import threading
 
+import pytest
+
 import optisocks5 as s5
 from optisocks5.aio import AsyncClient, AsyncOptimisticClient
 
@@ -200,3 +202,62 @@ def test_session_wrong_method_raises():
         assert False, "expected Socks5Error"
     except s5.Socks5Error as e:
         assert "method" in str(e)
+
+
+def test_session_no_acceptable_methods():
+    sess = s5.Session()
+    with pytest.raises(s5.Socks5Error) as ei:
+        sess.feed(b"\x05\xff")  # NO ACCEPTABLE METHODS sentinel
+    assert "NO ACCEPTABLE" in str(ei.value)
+
+
+def test_session_unknown_atyp_reply_raises():
+    # A complete reply with an unknown ATYP must raise, not hang forever.
+    sess = s5.Session()
+    sess.optimistic_pipeline("127.0.0.1", 80)
+    sess.feed(b"\x05\x00")  # method NO_AUTH
+    with pytest.raises(s5.Socks5Error) as ei:
+        sess.feed(b"\x05\x00\x00\x02\x00\x00\x00\x00\x00\x50")  # ATYP 0x02
+    assert "unknown ATYP" in str(ei.value)
+
+
+def test_session_reply_ipv6_dripfeed():
+    sess = s5.Session()
+    sess.optimistic_pipeline("h", 80)
+    sess.feed(b"\x05\x00")
+    v6 = bytes([5, 0, 0, 4]) + bytes(15) + bytes([1]) + bytes([0, 53])
+    out = None
+    for i in range(len(v6)):
+        out = sess.feed(v6[i : i + 1])
+    assert out == s5.Reply(0, "::1", 53)
+
+
+def test_session_feed_idempotent_after_done():
+    sess = s5.Session()
+    sess.optimistic_pipeline("h", 80)
+    reply = sess.feed(b"\x05\x00\x05\x00\x00\x01\x01\x02\x03\x04\x00\x50")
+    assert reply == s5.Reply(0, "1.2.3.4", 80)
+    # post-completion bytes belong to the tunnel: not consumed, Reply re-returned
+    assert sess.feed(b"TUNNEL") == reply
+    assert sess.leftover == b""
+
+
+def test_async_optimistic_leftover():
+    host, port, srv = _byte_exact_server(require_auth=False, banner=b"BANNER220")
+    with srv:
+
+        async def run():
+            async with AsyncOptimisticClient(host, port) as c:
+                await c.connect("example.com", 80)
+                return c.leftover
+
+        assert asyncio.run(run()) == b"BANNER220"
+
+
+def test_sync_client_reentry_guard():
+    host, port, srv = _byte_exact_server(require_auth=False)
+    with srv:
+        with s5.OptimisticClient(host, port) as c:
+            c.connect("example.com", 80)
+            with pytest.raises(RuntimeError):
+                c.connect("example.com", 80)  # already connected

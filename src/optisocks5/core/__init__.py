@@ -14,7 +14,7 @@ from .codec import (
     udp_encapsulate,
     userpass_auth,
 )
-from .session import Session
+from .session import Session, reply_size
 from .types import Cmd, Method, Rep, Reply, Socks5Error, rep_name
 
 __all__ = [
@@ -25,6 +25,7 @@ __all__ = [
     "Socks5Error",
     "rep_name",
     "Session",
+    "reply_size",
     "client_greeting",
     "parse_method_selection",
     "userpass_auth",

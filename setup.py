@@ -10,7 +10,7 @@ core = Extension(
     sources=["csrc/module.cpp", "csrc/socks5_codec.cpp"],
     include_dirs=["csrc"],
     language="c++",
-    extra_compile_args=["-std=c++20", "-O2", "-Wall", "-Wextra"],
+    extra_compile_args=["-std=c++20", "-O2", "-Wall", "-Wextra", "-Wpedantic"],
 )
 
 setup(ext_modules=[core])

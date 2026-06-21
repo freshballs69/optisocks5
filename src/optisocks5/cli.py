@@ -34,7 +34,12 @@ def _parse_proxy(url: str) -> tuple[str, int, str | None, str | None]:
 
 
 def _split_target(target: str, default_port: int = 80) -> tuple[str, int]:
-    if target.count(":") == 1:
+    if target.startswith("["):  # bracketed IPv6: [::1] or [::1]:443
+        host, sep, rest = target[1:].partition("]")
+        if sep and rest.startswith(":"):
+            return host, int(rest[1:])
+        return host, default_port
+    if target.count(":") == 1:  # host:port (a bare IPv6 literal has many colons)
         host, port = target.rsplit(":", 1)
         return host, int(port)
     return target, default_port
@@ -71,19 +76,20 @@ def cmd_connect(args: argparse.Namespace) -> int:
 
 def cmd_fetch(args: argparse.Namespace) -> int:
     proxy = _parse_proxy(args.proxy)
-    target, path = (args.target.split("/", 1) + [""])[:2]
-    path = "/" + path
-    dst_ip = socket.gethostbyname(target)  # local resolve = `curl -x socks5://`
+    hostport, _, rest = args.target.partition("/")  # split path off first
+    path = "/" + rest
+    host, dport = _split_target(hostport, default_port=80)
     client = _client(args.staged, proxy, args.timeout)
     try:
-        reply = client.connect(dst_ip, 80)
+        dst_ip = socket.gethostbyname(host)  # gaierror is an OSError subclass
+        reply = client.connect(dst_ip, dport)
     except (OSError, Socks5Error) as e:
         print(f"FAIL: {e}", file=sys.stderr)
         return 1
     print(f"[handshake] {rep_name(reply.rep)} bound={reply.host}:{reply.port}")
     with client:
         client.sock.sendall(
-            f"GET {path} HTTP/1.0\r\nHost: {target}\r\n"
+            f"GET {path} HTTP/1.0\r\nHost: {host}\r\n"
             f"User-Agent: curl/8\r\nConnection: close\r\n\r\n".encode()
         )
         client.sock.settimeout(5.0)  # don't rely on EOF; proxies hold tunnels open
@@ -140,8 +146,10 @@ def cmd_probe(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="optisocks5", description=__doc__.splitlines()[0])
-    p.add_argument("--timeout", type=float, default=10.0, help="per-phase timeout (s)")
+    p = argparse.ArgumentParser(
+        prog="optisocks5", description=(__doc__ or "optisocks5 CLI").splitlines()[0]
+    )
+    p.add_argument("--timeout", type=float, default=10.0, help="total handshake timeout (s)")
     sub = p.add_subparsers(dest="command", required=True)
 
     c = sub.add_parser("connect", help="run one handshake and report the reply")

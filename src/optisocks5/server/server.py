@@ -21,6 +21,7 @@ or C++ driver could replace it without touching the state machine.
 
 from __future__ import annotations
 
+import errno
 import socket
 import threading
 from typing import Callable, Generic, TypeVar
@@ -37,8 +38,9 @@ LifecycleHook = Callable[["ServerSession"], None]
 
 
 class Server(Generic[Ctx]):
-    def __init__(self, connect_timeout: float = 10.0):
+    def __init__(self, connect_timeout: float = 10.0, relay_timeout: float | None = None):
         self.connect_timeout = connect_timeout
+        self.relay_timeout = relay_timeout  # idle teardown for the relay phase
         self._authorize: AuthHook | None = None
         self._on_connect: ConnectHook | None = None
         self._on_disconnect: LifecycleHook | None = None
@@ -85,10 +87,13 @@ class Server(Generic[Ctx]):
             raise RuntimeError("call bind() first")
         try:
             while True:
-                conn, _ = srv.accept()
+                try:
+                    conn, _ = srv.accept()
+                except OSError as e:
+                    if self._sock is None or e.errno in (errno.EBADF, errno.EINVAL):
+                        break  # listener was closed -> stop
+                    continue  # transient (ECONNABORTED/EMFILE/EINTR) -> keep serving
                 threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
-        except OSError:
-            pass  # listening socket closed -> stop
         finally:
             srv.close()
             self._sock = None
@@ -119,13 +124,23 @@ class Server(Generic[Ctx]):
                     sess.receive(data)
                 elif isinstance(ev, Authorize):
                     if self._authorize is not None:
-                        self._authorize(sess, ev.username, ev.password)
+                        try:
+                            self._authorize(sess, ev.username, ev.password)
+                        except Exception:  # noqa: BLE001 — a bad hook = auth failure
+                            sess.reject()
                     else:
                         sess.ok(None)
                 elif isinstance(ev, Connect):
                     if self._on_connect is not None:
-                        self._on_connect(sess, ev.host, ev.port)
-                    if not sess._rejected:
+                        try:
+                            self._on_connect(sess, ev.host, ev.port)
+                        except Exception:  # noqa: BLE001 — bad hook = general failure
+                            sess.reject(Rep.GENERAL_FAILURE)
+                    if sess.rejected:
+                        pass  # state machine emits the error reply + Close
+                    elif sess.intercepted:
+                        sess.connected(ev.host, ev.port)  # serve in-memory, no dial
+                    else:
                         upstream = self._dial(sess)
                 elif isinstance(ev, Relay):
                     sess.upstream = upstream
@@ -148,21 +163,33 @@ class Server(Generic[Ctx]):
     def _dial(self, sess: ServerSession) -> socket.socket | None:
         try:
             up = socket.create_connection(sess.target, timeout=self.connect_timeout)
-            sess.connected(*up.getsockname())
+            host, port = up.getsockname()[:2]  # IPv6 sockname has 4 fields
+            sess.connected(host, port)
             return up
-        except OSError:
-            sess.connect_failed(Rep.HOST_UNREACHABLE)
-            return None
+        except ConnectionRefusedError:
+            sess.connect_failed(Rep.CONN_REFUSED)
+        except (socket.timeout, TimeoutError):
+            sess.connect_failed(Rep.TTL_EXPIRED)
+        except OSError as e:
+            sess.connect_failed(
+                Rep.NET_UNREACHABLE if e.errno == errno.ENETUNREACH else Rep.HOST_UNREACHABLE
+            )
+        return None
 
     def _relay(self, sess: ServerSession) -> None:
         if sess.custom_pipe is not None:
             sess.custom_pipe(sess)  # user owns the exchange (e.g. metered copy)
             return
-        splice(sess.downstream, sess.upstream)
+        splice(sess.downstream, sess.upstream, idle_timeout=self.relay_timeout)
 
 
-def splice(a: socket.socket, b: socket.socket) -> None:
-    """Default bidirectional copy until either side closes (blocking sockets)."""
+def splice(a: socket.socket, b: socket.socket, idle_timeout: float | None = None) -> None:
+    """Default bidirectional copy until either side closes (blocking sockets).
+    `idle_timeout` (seconds) tears down a half-open silent peer instead of
+    pinning the thread forever; None blocks until FIN."""
+    if idle_timeout is not None:
+        a.settimeout(idle_timeout)
+        b.settimeout(idle_timeout)
 
     def copy(src: socket.socket, dst: socket.socket) -> None:
         try:
@@ -171,7 +198,7 @@ def splice(a: socket.socket, b: socket.socket) -> None:
                 if not data:
                     break
                 dst.sendall(data)
-        except OSError:
+        except OSError:  # incl. socket.timeout on an idle stream
             pass
         finally:
             try:

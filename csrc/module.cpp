@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -24,13 +25,33 @@ std::span<const std::uint8_t> as_span(const char* buf, Py_ssize_t len) {
           static_cast<std::size_t>(len)};
 }
 
+// Validate a parsed int is in [0, max]; else set ValueError and return false.
+bool in_range(long v, long max, const char* name) {
+  if (v < 0 || v > max) {
+    PyErr_Format(PyExc_ValueError, "%s out of range [0, %ld]", name, max);
+    return false;
+  }
+  return true;
+}
+
+// Translate a builder's std::length_error (oversize length-prefixed field) into
+// a Python ValueError so a foundation codec rejects what it cannot encode.
+PyObject* value_error(const std::length_error& e) {
+  PyErr_SetString(PyExc_ValueError, e.what());
+  return nullptr;
+}
+
 // ---- TCP control channel ---------------------------------------------------
 
 PyObject* py_client_greeting(PyObject*, PyObject* args) {
   const char* methods;
   Py_ssize_t len;
   if (!PyArg_ParseTuple(args, "y#", &methods, &len)) return nullptr;
-  return bytes_from(s5::client_greeting(as_span(methods, len)));
+  try {
+    return bytes_from(s5::client_greeting(as_span(methods, len)));
+  } catch (const std::length_error& e) {
+    return value_error(e);
+  }
 }
 
 PyObject* py_parse_method_selection(PyObject*, PyObject* args) {
@@ -49,8 +70,12 @@ PyObject* py_userpass_auth(PyObject*, PyObject* args) {
   Py_ssize_t plen;
   if (!PyArg_ParseTuple(args, "s#s#", &user, &ulen, &pass, &plen))
     return nullptr;
-  return bytes_from(s5::userpass_auth(std::string_view(user, ulen),
-                                      std::string_view(pass, plen)));
+  try {
+    return bytes_from(s5::userpass_auth(std::string_view(user, ulen),
+                                        std::string_view(pass, plen)));
+  } catch (const std::length_error& e) {
+    return value_error(e);
+  }
 }
 
 PyObject* py_parse_auth_reply(PyObject*, PyObject* args) {
@@ -67,8 +92,14 @@ PyObject* py_request(PyObject*, PyObject* args) {
   const char* host;
   int port;
   if (!PyArg_ParseTuple(args, "isi", &cmd, &host, &port)) return nullptr;
+  if (!in_range(cmd, 255, "cmd") || !in_range(port, 65535, "port"))
+    return nullptr;
   s5::Address dst{host, static_cast<std::uint16_t>(port)};
-  return bytes_from(s5::request(static_cast<std::uint8_t>(cmd), dst));
+  try {
+    return bytes_from(s5::request(static_cast<std::uint8_t>(cmd), dst));
+  } catch (const std::length_error& e) {
+    return value_error(e);
+  }
 }
 
 PyObject* py_parse_reply(PyObject*, PyObject* args) {
@@ -77,7 +108,8 @@ PyObject* py_parse_reply(PyObject*, PyObject* args) {
   if (!PyArg_ParseTuple(args, "y#", &buf, &len)) return nullptr;
   auto r = s5::parse_reply(as_span(buf, len));
   if (!r) Py_RETURN_NONE;
-  return Py_BuildValue("(isi)", static_cast<int>(r->rep), r->bound.host.c_str(),
+  return Py_BuildValue("(is#i)", static_cast<int>(r->rep), r->bound.host.data(),
+                       static_cast<Py_ssize_t>(r->bound.host.size()),
                        static_cast<int>(r->bound.port));
 }
 
@@ -95,6 +127,7 @@ PyObject* py_parse_greeting(PyObject*, PyObject* args) {
 PyObject* py_method_selection(PyObject*, PyObject* args) {
   int method;
   if (!PyArg_ParseTuple(args, "i", &method)) return nullptr;
+  if (!in_range(method, 255, "method")) return nullptr;
   return bytes_from(s5::method_selection(static_cast<std::uint8_t>(method)));
 }
 
@@ -104,12 +137,15 @@ PyObject* py_parse_userpass(PyObject*, PyObject* args) {
   if (!PyArg_ParseTuple(args, "y#", &buf, &len)) return nullptr;
   auto up = s5::parse_userpass(as_span(buf, len));
   if (!up) Py_RETURN_NONE;
-  return Py_BuildValue("(ss)", up->user.c_str(), up->pass.c_str());
+  return Py_BuildValue("(s#s#)", up->user.data(),
+                       static_cast<Py_ssize_t>(up->user.size()), up->pass.data(),
+                       static_cast<Py_ssize_t>(up->pass.size()));
 }
 
 PyObject* py_auth_reply(PyObject*, PyObject* args) {
   int status;
   if (!PyArg_ParseTuple(args, "i", &status)) return nullptr;
+  if (!in_range(status, 255, "status")) return nullptr;
   return bytes_from(s5::auth_reply(static_cast<std::uint8_t>(status)));
 }
 
@@ -119,7 +155,8 @@ PyObject* py_parse_request(PyObject*, PyObject* args) {
   if (!PyArg_ParseTuple(args, "y#", &buf, &len)) return nullptr;
   auto req = s5::parse_request(as_span(buf, len));
   if (!req) Py_RETURN_NONE;
-  return Py_BuildValue("(isi)", static_cast<int>(req->cmd), req->dst.host.c_str(),
+  return Py_BuildValue("(is#i)", static_cast<int>(req->cmd), req->dst.host.data(),
+                       static_cast<Py_ssize_t>(req->dst.host.size()),
                        static_cast<int>(req->dst.port));
 }
 
@@ -128,8 +165,14 @@ PyObject* py_reply(PyObject*, PyObject* args) {
   const char* host;
   int port;
   if (!PyArg_ParseTuple(args, "isi", &rep, &host, &port)) return nullptr;
+  if (!in_range(rep, 255, "rep") || !in_range(port, 65535, "port"))
+    return nullptr;
   s5::Address bound{host, static_cast<std::uint16_t>(port)};
-  return bytes_from(s5::reply(static_cast<std::uint8_t>(rep), bound));
+  try {
+    return bytes_from(s5::reply(static_cast<std::uint8_t>(rep), bound));
+  } catch (const std::length_error& e) {
+    return value_error(e);
+  }
 }
 
 // ---- UDP data channel ------------------------------------------------------
@@ -142,9 +185,15 @@ PyObject* py_udp_encapsulate(PyObject*, PyObject* args) {
   int frag = 0;
   if (!PyArg_ParseTuple(args, "siy#|i", &host, &port, &buf, &len, &frag))
     return nullptr;
+  if (!in_range(port, 65535, "port") || !in_range(frag, 255, "frag"))
+    return nullptr;
   s5::Address dst{host, static_cast<std::uint16_t>(port)};
-  return bytes_from(s5::udp_encapsulate(dst, as_span(buf, len),
-                                        static_cast<std::uint8_t>(frag)));
+  try {
+    return bytes_from(s5::udp_encapsulate(dst, as_span(buf, len),
+                                          static_cast<std::uint8_t>(frag)));
+  } catch (const std::length_error& e) {
+    return value_error(e);
+  }
 }
 
 PyObject* py_udp_decapsulate(PyObject*, PyObject* args) {
@@ -154,8 +203,10 @@ PyObject* py_udp_decapsulate(PyObject*, PyObject* args) {
   auto d = s5::udp_decapsulate(as_span(buf, len));
   if (!d) Py_RETURN_NONE;
   // (frag, host, port, payload)
-  return Py_BuildValue("(isiy#)", static_cast<int>(d->frag),
-                       d->origin.host.c_str(), static_cast<int>(d->origin.port),
+  return Py_BuildValue("(is#iy#)", static_cast<int>(d->frag),
+                       d->origin.host.data(),
+                       static_cast<Py_ssize_t>(d->origin.host.size()),
+                       static_cast<int>(d->origin.port),
                        reinterpret_cast<const char*>(d->payload.data()),
                        static_cast<Py_ssize_t>(d->payload.size()));
 }

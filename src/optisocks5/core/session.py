@@ -72,11 +72,14 @@ class Session:
         """Consume proxy reply bytes. Returns the final :class:`Reply` once the
         whole handshake is parsed, else ``None`` (need more bytes).
 
-        Raises :class:`Socks5Error` if the proxy picks an unexpected method or
-        rejects auth — the typical symptoms of a non-byte-exact reader desyncing
-        on the pipelined bytes.
+        Raises :class:`Socks5Error` if the proxy picks an unexpected method,
+        rejects auth, or sends a reply with an unknown ATYP — the typical
+        symptoms of a non-byte-exact reader desyncing on the pipelined bytes.
+        Idempotent once complete: further calls return the same Reply and do not
+        consume bytes (post-handshake bytes belong to the tunnel, not here).
         """
-        self._buf += data
+        if self._state != "done":  # post-completion bytes belong to the tunnel
+            self._buf += data
         while True:
             if self._state == "method":
                 if len(self._buf) < 2:
@@ -85,6 +88,10 @@ class Session:
                 if m is None:
                     raise Socks5Error("malformed method selection")
                 if m != self.method:
+                    if m == Method.NO_ACCEPTABLE:
+                        raise Socks5Error(
+                            "proxy rejected all offered methods (NO ACCEPTABLE METHODS)"
+                        )
                     raise Socks5Error(
                         f"proxy chose method {m}, we offered only {int(self.method)}"
                     )
@@ -101,6 +108,8 @@ class Session:
                 del self._buf[:2]
                 self._state = "reply"
             elif self._state == "reply":
+                if len(self._buf) >= 4 and self._buf[3] not in (0x01, 0x03, 0x04):
+                    raise Socks5Error(f"reply has unknown ATYP {self._buf[3]}")
                 n = reply_size(bytes(self._buf))
                 if n is None or len(self._buf) < n:
                     return None  # reply not fully arrived yet

@@ -9,12 +9,14 @@ asyncio).
 
 | Module | What | I/O? |
 |---|---|---|
-| `optisocks5.core` | the agnostic layer: C++ codec (`client_greeting`, `userpass_auth`, `request`, `parse_reply`, `udp_encapsulate`/`udp_decapsulate`) + the sans-IO `Session` (`optimistic_pipeline()` glues greeting+auth+request; `feed()` consumes replies) | none |
-| `optisocks5.sync` | blocking-sockets drivers: `Client` (staged) and `OptimisticClient` (one-shot) | blocking |
-| `optisocks5.aio` | asyncio drivers: `AsyncClient` and `AsyncOptimisticClient` | asyncio |
+| `optisocks5.core` | the agnostic layer: C++ codec — client side (`client_greeting`, `parse_method_selection`, `userpass_auth`, `parse_auth_reply`, `request`, `parse_reply`), server side (`parse_greeting`, `method_selection`, `parse_userpass`, `auth_reply`, `parse_request`, `reply`), `udp_encapsulate`/`udp_decapsulate` — plus the sans-IO `Session` (`optimistic_pipeline()` glues greeting+auth+request; `feed()` consumes replies) and `reply_size()` | none |
+| `optisocks5.sync` | blocking-sockets clients: `Client` (staged) and `OptimisticClient` (one-shot) | blocking |
+| `optisocks5.aio` | asyncio clients: `AsyncClient` and `AsyncOptimisticClient` | asyncio |
+| `optisocks5.server` | hook-driven server: sans-IO `ServerSession` (emits `Send`/`NeedData`/`Authorize`/`Connect`/`Relay`/`Close` intents) + threaded `Server` and asyncio `AsyncServer` | per driver |
 
 Every public name is also re-exported at the top level (`import optisocks5 as
-s5; s5.OptimisticClient`). The C extension itself is `optisocks5._core`.
+s5; s5.OptimisticClient`, `s5.Server`). The C extension itself is
+`optisocks5._core` (shipped with a `_core.pyi` stub; the package is typed).
 
 `Client` vs `OptimisticClient` differ by one feature: the optimistic one ships
 the whole handshake in a single send and never waits between phases; the staged
@@ -73,4 +75,29 @@ dg = s5.udp_encapsulate("8.8.8.8", 53, query)     # [RSV][FRAG][ATYP][ADDR][PORT
 frag, host, port, data = s5.udp_decapsulate(reply)
 ```
 
-See `examples/async_connect.py` for a full asyncio driver.
+Hook-driven server (threaded or asyncio, same `ServerSession` core):
+
+```python
+from optisocks5.server import Server
+
+server = Server()                 # an authorize hook flips on userpass auth
+
+@server.authorize                 # s.ok(ctx) / s.reject()
+def authorize(s, user, password): s.ok({"user": user})
+
+@server.on_connect                # block / redirect / intercept per request
+def on_connect(s, host, port):
+    if blocked(host): s.reject()                  # -> error reply
+    # s.set_target(h, p)  redirect   |   s.intercept(fn)  serve in-memory
+    # s.pipe(fn)          meter/transform the relayed bytes
+
+server.serve("0.0.0.0", 1080)
+```
+
+`AsyncServer` is the asyncio mirror (hooks may be `async`). Only CONNECT is
+served by default; non-SOCKS5 / bad-ATYP / oversize peers are rejected with a
+protocol reply, not left hanging.
+
+See `examples/` — `async_connect.py` (asyncio client), `async_server.py`
+(in-memory upstream), `server_metered.py` (per-user byte metering),
+`proxy_test.py` (behaviour battery), `selector_connect.py` (selectors fan-out).

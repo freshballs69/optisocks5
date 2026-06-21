@@ -5,6 +5,8 @@ import socket
 import threading
 import time
 
+import pytest
+
 import optisocks5 as s5
 from optisocks5.core import Cmd, Method, client_greeting, parse_reply, request, userpass_auth
 from optisocks5.server import (
@@ -181,3 +183,123 @@ def test_end_to_end_auth_and_metered_pipe():
                 break
             time.sleep(0.05)
         assert counts.get("alice", 0) >= 100  # at least the upstream-bound bytes
+
+
+# ---- sans-IO hardening (rank 5 / 12) ---------------------------------------
+
+
+def test_server_session_rejects_bad_version():
+    s = ServerSession(require_auth=False)
+    s.receive(b"\x04\x01\x00")  # SOCKS4, not SOCKS5
+    assert isinstance(s.next_event(), Close)
+
+
+def test_server_session_unknown_atyp_rejected():
+    s = ServerSession(require_auth=False)
+    s.receive(client_greeting(bytes([s5.Method.NO_AUTH])))
+    s.next_event()  # Send method
+    s.next_event()  # NeedData
+    s.receive(b"\x05\x01\x00\x09\x01\x02")  # ATYP 0x09 + >=5 bytes
+    ev = s.next_event()
+    assert isinstance(ev, Send) and parse_reply(ev.data)[0] == s5.Rep.ATYP_NOT_SUPPORTED
+    assert isinstance(s.next_event(), Close)
+
+
+def test_server_session_rejects_non_connect():
+    s = ServerSession(require_auth=False)
+    s.receive(client_greeting(bytes([s5.Method.NO_AUTH])))
+    s.next_event()
+    s.next_event()
+    s.receive(request(s5.Cmd.UDP_ASSOCIATE, "1.2.3.4", 80))
+    ev = s.next_event()
+    assert isinstance(ev, Send) and parse_reply(ev.data)[0] == s5.Rep.CMD_NOT_SUPPORTED
+    assert isinstance(s.next_event(), Close)
+
+
+# ---- threaded driver end-to-end (rank 1 / 8 / 12) --------------------------
+
+
+def test_threaded_intercept_does_not_dial():
+    server = Server()
+
+    @server.on_connect
+    def on_connect(s, host, port):
+        def handler(sess):
+            sess.downstream.recv(4096)
+            sess.downstream.sendall(b"INMEM")
+
+        s.intercept(handler)  # unroutable host must NOT be dialed
+
+    sh, sp = _run_server(server)
+    try:
+        with s5.Client(sh, sp) as c:
+            c.connect("fake.invalid", 80)
+            c.sock.sendall(b"hi")
+            assert c.sock.recv(16) == b"INMEM"
+    finally:
+        server.close()
+
+
+def test_optimistic_client_through_server():
+    # the server must drain greeting+request arriving glued in one packet
+    eh, ep, esrv = _echo_target()
+    server = Server()
+    with esrv:
+        sh, sp = _run_server(server)
+        try:
+            with s5.OptimisticClient(sh, sp) as c:
+                c.connect(eh, ep)
+                c.sock.sendall(b"opt")
+                assert c.sock.recv(16) == b"opt"
+        finally:
+            server.close()
+
+
+def test_set_target_redirect():
+    eh, ep, esrv = _echo_target()
+    server = Server()
+
+    @server.on_connect
+    def on_connect(s, host, port):
+        s.set_target(eh, ep)  # redirect anywhere to the echo server
+
+    with esrv:
+        sh, sp = _run_server(server)
+        try:
+            with s5.Client(sh, sp) as c:
+                c.connect("nowhere.invalid", 1)
+                c.sock.sendall(b"redir")
+                assert c.sock.recv(16) == b"redir"
+        finally:
+            server.close()
+
+
+def test_connect_refused_maps_to_conn_refused():
+    server = Server()
+    tmp = socket.socket()
+    tmp.bind(("127.0.0.1", 0))
+    refused_port = tmp.getsockname()[1]
+    tmp.close()  # nothing listens here now -> RST
+    sh, sp = _run_server(server)
+    try:
+        with pytest.raises(s5.Socks5Error) as ei:
+            s5.Client(sh, sp).connect("127.0.0.1", refused_port)
+        assert "CONN_REFUSED" in str(ei.value)
+    finally:
+        server.close()
+
+
+def test_hook_exception_yields_general_failure_reply():
+    server = Server()
+
+    @server.on_connect
+    def on_connect(s, host, port):
+        raise ValueError("boom")
+
+    sh, sp = _run_server(server)
+    try:
+        with pytest.raises(s5.Socks5Error) as ei:
+            s5.Client(sh, sp).connect("1.2.3.4", 80)
+        assert "GENERAL_FAILURE" in str(ei.value)
+    finally:
+        server.close()

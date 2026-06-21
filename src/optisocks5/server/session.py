@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections import deque
 from typing import Generic, TypeVar
 
-from ..core import Method, Rep
+from ..core import Cmd, Method, Rep
 from .._core import (
     auth_reply,
     method_selection,
@@ -109,6 +109,11 @@ class ServerSession(Generic[Ctx]):
     def intercepted(self) -> bool:
         return self._intercept
 
+    @property
+    def rejected(self) -> bool:
+        """Whether a hook rejected the current phase (public; drivers read this)."""
+        return self._rejected
+
     def connected(self, bnd_host: str = "0.0.0.0", bnd_port: int = 0) -> None:
         """Driver opened the upstream; `bnd` is what to advertise in the reply."""
         self._connected_bnd = (bnd_host, bnd_port)
@@ -133,8 +138,14 @@ class ServerSession(Generic[Ctx]):
         st = self._state
 
         if st == "greeting":
+            if self._buf and self._buf[0] != 0x05:
+                self._state = "closed"
+                return self._emit(Close("not a SOCKS5 greeting (bad version)"))
             methods = parse_greeting(bytes(self._buf))
             if methods is None:
+                if len(self._buf) > 2 + 255:  # NMETHODS caps the greeting size
+                    self._state = "closed"
+                    return self._emit(Close("greeting too large"))
                 return NeedData()
             del self._buf[: 2 + self._buf[1]]
             if not self._require_auth:
@@ -152,6 +163,9 @@ class ServerSession(Generic[Ctx]):
         if st == "auth":
             up = parse_userpass(bytes(self._buf))
             if up is None:
+                if len(self._buf) > 3 + 255 + 255:  # ULEN+PLEN cap the message
+                    self._state = "closed"
+                    return self._emit(Close("auth message too large"))
                 return NeedData()
             ulen = self._buf[1]
             plen = self._buf[2 + ulen]
@@ -169,14 +183,38 @@ class ServerSession(Generic[Ctx]):
 
         if st == "request":
             n = _request_len(bytes(self._buf))
-            if n is None or len(self._buf) < n:
+            if n is None:
+                # Position of ATYP is known but it isn't one we can size => an
+                # unsupported address type. Reject instead of waiting forever.
+                if len(self._buf) >= 5:
+                    self._state = "closed"
+                    return self._emit(
+                        Send(reply(Rep.ATYP_NOT_SUPPORTED, "0.0.0.0", 0)),
+                        Close("unsupported address type"),
+                    )
+                return NeedData()
+            if len(self._buf) < n:
+                if len(self._buf) > 4 + 1 + 255 + 2:  # max well-formed request
+                    self._state = "closed"
+                    return self._emit(Close("request too large"))
                 return NeedData()
             parsed = parse_request(bytes(self._buf[:n]))
             if parsed is None:
                 self._state = "closed"
-                return self._emit(Close("malformed request"))
+                return self._emit(
+                    Send(reply(Rep.GENERAL_FAILURE, "0.0.0.0", 0)),
+                    Close("malformed request"),
+                )
             del self._buf[:n]
             self.cmd, host, port = parsed
+            if self.cmd != Cmd.CONNECT:
+                # Only CONNECT is handled by default; BIND/UDP-ASSOCIATE would
+                # need a dedicated path. Reject rather than relay them as TCP.
+                self._state = "closed"
+                return self._emit(
+                    Send(reply(Rep.CMD_NOT_SUPPORTED, "0.0.0.0", 0)),
+                    Close("command not supported (only CONNECT)"),
+                )
             self.target = (host, port)  # default: transparent (hook may override)
             self._rejected = False
             self._connected_bnd = None

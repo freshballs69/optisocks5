@@ -68,6 +68,7 @@ class ServerSession(Generic[Ctx]):
         self._rep = Rep.GENERAL_FAILURE
         self._connected_bnd: tuple[str, int] | None = None
         self._connect_failed = False
+        self._relay_raw = False
 
     # ---- driver feeds bytes -------------------------------------------------
 
@@ -93,6 +94,13 @@ class ServerSession(Generic[Ctx]):
     def pipe(self, fn) -> None:
         """Replace the default bidirectional splice with a custom relay fn."""
         self._custom_pipe = fn
+
+    def relay_raw(self) -> None:
+        """Transition straight to relay on the next ``connect_wait`` step, emitting
+        ONLY a ``Relay`` event and NO automatic SUCCEEDED reply — the custom pipe owns
+        the SOCKS5 reply. Used by an in-process router that sends the real verdict
+        (SUCCEEDED / NOT_ALLOWED / a dial-failure rep) itself via its link."""
+        self._relay_raw = True
 
     def intercept(self, fn) -> None:
         """Serve this request from an IN-MEMORY handler: the driver opens NO real
@@ -223,6 +231,12 @@ class ServerSession(Generic[Ctx]):
             return Connect(self.cmd, host, port)
 
         if st == "connect_wait":
+            if self._relay_raw:
+                # inproc router owns BOTH the reply (sent via its link.ack) and the
+                # splice: emit only Relay, never an auto SUCCEEDED.
+                self._state = "relay"
+                tg = self.target or ("0.0.0.0", 0)
+                return Relay(tg[0], tg[1])
             if self._rejected:
                 self._state = "closed"
                 return self._emit(
